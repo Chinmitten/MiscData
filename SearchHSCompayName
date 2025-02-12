@@ -1,0 +1,63 @@
+import requests
+import pandas as pd
+
+#Script is for searching HubSpot based on company name, returns name and record ID to a csv. Meant to be used for quick updates/re-assignments.
+# HubSpot API Key
+API_KEY = '' 
+
+SEARCH_URL = 'https://api.hubapi.com/crm/v3/objects/companies/search'
+
+headers = {
+    'Authorization': f'Bearer {API_KEY}',
+    'Content-Type': 'application/json'
+}
+
+def search_companies(company_names):
+    results = []
+    
+    for name in company_names:
+        # Prepare the request body
+        data = {
+            "filterGroups": [
+                {
+                    "filters": [
+                        {
+                            "propertyName": "name",
+                            "operator": "EQ",
+                            "value": name
+                        }
+                    ]
+                }
+            ],
+            "properties": ["name", "hs_object_id"]
+        }
+        
+        response = requests.post(SEARCH_URL, headers=headers, json=data)
+        
+        if response.status_code == 200:
+            companies = response.json().get('results', [])
+            for company in companies:
+                results.append({
+                    'Company Name': company['properties']['name'],
+                    'Record ID': company['properties']['hs_object_id']
+                })
+        else:
+            print(f"Failed to search for company: {name}. Status code: {response.status_code}")
+    
+    return results
+
+#Name your output here
+def save_to_csv(data, filename='companies.csv'):
+    df = pd.DataFrame(data)
+    df.to_csv(filename, index=False)
+    print(f"Data saved to {filename}")
+
+#Search Companies here
+if __name__ == "__main__":
+    company_names = [
+        "#NAMESHERE"
+    ]
+    
+    search_results = search_companies(company_names)
+    
+    save_to_csv(search_results)
