@@ -387,10 +387,10 @@ def main():
     Main function - configure and run the pipeline
     """
     # Configuration - Set these values
-    HUBSPOT_TOKEN = "pat-na1-4a710947-73b1-439f-b6c3-354fd77debd9"
-    AVOMA_API_KEY = "wp0m5mpsf1:2loqx6u638g6d4d9x113"
-    WEBHOOK_URL = "https://api.clay.com/v3/sources/webhook/pull-in-data-from-a-webhook-c823042a-9656-4459-85ab-b16b182635eb"
-    HUBSPOT_LIST_ID = "43049"
+    HUBSPOT_TOKEN = ""
+    AVOMA_API_KEY = ""
+    WEBHOOK_URL = ""
+    HUBSPOT_LIST_ID = ""
     
     # Validate configuration
     if any(val == "your_" + key.lower() for key, val in [
