@@ -1,0 +1,562 @@
+#!/usr/bin/env python3
+"""
+HubSpot -> Avoma -> Webhook
+Requirement: Only post meetings where attendees include BOTH:
+  • the HubSpot contact's email, and
+  • the HubSpot contact owner's email
+
+Env vars (required):
+  HUBSPOT_TOKEN     = HubSpot Private App token (crm.lists.read, crm.objects.contacts.read, crm.objects.owners.read)
+  AVOMA_API_KEY     = Avoma API key (meetings.read, transcripts.read)
+  WEBHOOK_URL       = Destination webhook (e.g., Clay)
+  HUBSPOT_LIST_ID   = HubSpot list ID (v3 Lists)
+
+CLI (optional):
+  --days 60
+  --delay 0.5
+  --avoma-limit 25
+  --only-email you@example.com   # repeatable
+"""
+
+import os
+import sys
+import json
+import time
+import logging
+import argparse
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Any, Optional
+
+import requests
+
+# ---------- Logging ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("hubspot_avoma_plaintext_pipeline.log")
+    ]
+)
+logger = logging.getLogger("hubspot-avoma-plain")
+
+# ---------- Utilities ----------
+def transcript_json_to_text(t) -> str:
+    if not t:
+        return ""
+    if isinstance(t, dict):
+        for k in ("content", "text", "transcript", "body"):
+            v = t.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    lines: List[str] = []
+    def add_line(speaker, txt):
+        if not txt:
+            return
+        txt = txt.strip()
+        if not txt:
+            return
+        if speaker:
+            lines.append(f"{speaker}: {txt}")
+        else:
+            lines.append(txt)
+    if isinstance(t, dict) and isinstance(t.get("transcript"), list):
+        speaker_map = {}
+        spk = t.get("speakers")
+        if isinstance(spk, list):
+            for s in spk:
+                sid = s.get("id")
+                name = s.get("name") or s.get("speaker") or (f"Speaker {sid}" if sid is not None else None)
+                if sid is not None and name:
+                    speaker_map[sid] = name
+        for turn in t["transcript"]:
+            if not isinstance(turn, dict):
+                continue
+            text = turn.get("transcript") or turn.get("text")
+            sid = turn.get("speaker_id")
+            speaker_name = speaker_map.get(sid) if sid is not None else None
+            add_line(speaker_name, text)
+        if lines:
+            return "\n".join(lines).strip()
+    if isinstance(t, dict):
+        if isinstance(t.get("paragraphs"), list):
+            for p in t["paragraphs"]:
+                add_line(p.get("speaker") or p.get("speaker_label"), p.get("text"))
+        if isinstance(t.get("segments"), list):
+            for s in t["segments"]:
+                add_line(s.get("speaker") or s.get("speaker_label"), s.get("text"))
+        for key in ("monologues", "utterances"):
+            if isinstance(t.get(key), list):
+                for m in t[key]:
+                    spk = m.get("speaker") or m.get("speaker_label")
+                    txt = m.get("text")
+                    if not txt and isinstance(m.get("elements"), list):
+                        txt = " ".join(e.get("text", "") for e in m["elements"] if isinstance(e, dict))
+                    add_line(spk, txt)
+        if isinstance(t.get("results"), list):
+            for r in t["results"]:
+                sub = transcript_json_to_text(r)
+                if sub:
+                    lines.append(sub)
+        if lines:
+            return "\n".join(lines).strip()
+    if isinstance(t, list):
+        for item in t:
+            sub = transcript_json_to_text(item)
+            if sub:
+                lines.append(sub)
+        if lines:
+            return "\n".join(lines).strip()
+    if isinstance(t, str):
+        return t.strip()
+    return "\n".join(lines).strip()
+
+def sizeof_json(obj: Any) -> int:
+    try:
+        return len(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+    except Exception:
+        return 0
+
+def safe_attendee_emails(meeting: Dict[str, Any]) -> List[str]:
+    emails: List[str] = []
+    for key in ("attendees", "participants", "guests"):
+        arr = meeting.get(key)
+        if isinstance(arr, list):
+            for a in arr:
+                if isinstance(a, dict):
+                    e = (a.get("email") or "").strip().lower()
+                    if e:
+                        emails.append(e)
+    if isinstance(meeting.get("attendee_emails"), list):
+        for e in meeting["attendee_emails"]:
+            if isinstance(e, str):
+                ee = e.strip().lower()
+                if ee:
+                    emails.append(ee)
+    return sorted(set(emails))
+
+def emails_required_in_meeting(meeting: Dict[str, Any], contact_email: str, owner_email: Optional[str]) -> bool:
+    """Require contact_email AND owner_email to be present in attendees."""
+    attendees = set(safe_attendee_emails(meeting))
+    ce = (contact_email or "").strip().lower()
+    oe = (owner_email or "").strip().lower() if owner_email else None
+    if not ce:
+        return False
+    if ce not in attendees:
+        return False
+    if oe:
+        return oe in attendees
+    # If no owner email available, fail closed (require owner)
+    return False
+
+# ---------- Pipeline ----------
+class Pipeline:
+    def __init__(
+        self,
+        hubspot_token: str,
+        avoma_api_key: str,
+        webhook_url: str,
+        hubspot_list_id: str,
+        rate_limit_delay: float = 0.5,
+        date_filter_days: int = 30,
+        avoma_limit: int = 25,
+        only_emails: Optional[List[str]] = None,
+    ):
+        self.hubspot_token = hubspot_token
+        self.avoma_api_key = avoma_api_key
+        self.webhook_url = webhook_url
+        self.hubspot_list_id = hubspot_list_id
+        self.rate_limit_delay = rate_limit_delay
+        self.date_filter_days = date_filter_days
+        self.avoma_limit = avoma_limit
+        self.only_emails = [e.strip().lower() for e in (only_emails or []) if e] or None
+
+        self.hubspot_base = "https://api.hubapi.com"
+        self.avoma_base = "https://api.avoma.com"
+
+        self.hubspot_headers = {
+            "Authorization": f"Bearer {hubspot_token}",
+            "Content-Type": "application/json",
+        }
+        self.avoma_headers = {
+            "Authorization": f"Bearer {avoma_api_key}",
+            "Content-Type": "application/json",
+        }
+        self.webhook_headers = {"Content-Type": "application/json"}
+
+        # owners cache: id -> email
+        self._owner_email_cache: Dict[str, Optional[str]] = {}
+
+    # ----- HTTP with light retry -----
+    def _request(self, method: str, url: str, headers: Dict[str, str], **kwargs) -> Optional[requests.Response]:
+        backoff = 1.0
+        for _ in range(6):
+            try:
+                r = requests.request(method, url, headers=headers, timeout=45, **kwargs)
+            except Exception as e:
+                logger.warning(f"{method} {url} -> EXCEPTION {type(e).__name__}: {e}")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 20.0)
+                continue
+            body_preview = (r.text or "")[:500].replace("\n", " ")
+            logger.info(f"{method} {r.url} -> {r.status_code} {body_preview}")
+            if r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 20.0)
+                continue
+            return r
+        return None
+
+    # ----- HubSpot: list members -----
+    def get_list_member_contact_ids(self) -> List[str]:
+        list_url = f"{self.hubspot_base}/crm/v3/lists/{self.hubspot_list_id}"
+        r_list = self._request("GET", list_url, self.hubspot_headers)
+        if not r_list or r_list.status_code == 404:
+            raise RuntimeError("HubSpot list not found or no response.")
+        r_list.raise_for_status()
+        list_data_raw = r_list.json() or {}
+        list_data = list_data_raw.get("list", list_data_raw)
+        obj_type = (list_data.get("objectTypeId") or "").strip()
+        logger.info(f"List objectTypeId = '{obj_type or 'UNKNOWN'}' (contacts are '0-1')")
+
+        url = f"{self.hubspot_base}/crm/v3/lists/{self.hubspot_list_id}/memberships"
+        params = {"limit": 100}
+        ids: List[str] = []
+        after = None
+        while True:
+            if after:
+                params["after"] = after
+            r = self._request("GET", url, self.hubspot_headers, params=params)
+            if not r:
+                raise RuntimeError("No response from HubSpot memberships")
+            if r.status_code == 404:
+                raise RuntimeError("HubSpot memberships 404")
+            r.raise_for_status()
+            data = r.json() or {}
+            for item in data.get("results", []):
+                rid = item.get("recordId")
+                if rid:
+                    ids.append(str(rid))
+            after = data.get("paging", {}).get("next", {}).get("after")
+            if not after:
+                break
+            time.sleep(self.rate_limit_delay)
+        logger.info(f"Collected {len(ids)} contact IDs from list")
+        return ids
+
+    # ----- HubSpot: batch-read contacts -> emails + owner IDs -----
+    def batch_read_contacts(self, ids: List[str], props: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        if not ids:
+            return []
+        if props is None:
+            props = ["email", "firstname", "lastname", "hubspot_owner_id"]
+        url = f"{self.hubspot_base}/crm/v3/objects/contacts/batch/read"
+        out: List[Dict[str, Any]] = []
+        for i in range(0, len(ids), 100):
+            chunk = ids[i : i + 100]
+            payload = {"properties": props, "inputs": [{"id": x} for x in chunk]}
+            r = self._request("POST", url, self.hubspot_headers, json=payload)
+            if not r:
+                raise RuntimeError("No response from HubSpot batch read")
+            r.raise_for_status()
+            out.extend(r.json().get("results", []))
+            time.sleep(self.rate_limit_delay)
+        logger.info(f"Batch-read {len(out)} contacts")
+        return out
+
+    # ----- HubSpot: owners (id -> email) with cache -----
+    def get_owner_email(self, owner_id: Optional[str]) -> Optional[str]:
+        if not owner_id:
+            return None
+        owner_id = str(owner_id)
+        if owner_id in self._owner_email_cache:
+            return self._owner_email_cache[owner_id]
+        url = f"{self.hubspot_base}/crm/v3/owners/{owner_id}"
+        r = self._request("GET", url, self.hubspot_headers)
+        if not r or r.status_code == 404:
+            self._owner_email_cache[owner_id] = None
+            return None
+        try:
+            r.raise_for_status()
+            data = r.json() or {}
+            email = (data.get("email") or "").strip().lower()
+            self._owner_email_cache[owner_id] = email or None
+            return self._owner_email_cache[owner_id]
+        except Exception:
+            self._owner_email_cache[owner_id] = None
+            return None
+
+    @staticmethod
+    def extract_email_and_owner_id(contact: Dict[str, Any]) -> (Optional[str], Optional[str]):
+        props = contact.get("properties") or {}
+        email = (props.get("email") or "").strip().lower() or None
+        owner_id = props.get("hubspot_owner_id")
+        if owner_id is not None:
+            owner_id = str(owner_id).strip()
+            if not owner_id:
+                owner_id = None
+        return email, owner_id
+
+    @staticmethod
+    def extract_emails(contacts: List[Dict[str, Any]]) -> List[str]:
+        emails: List[str] = []
+        for c in contacts:
+            props = c.get("properties") or {}
+            e = (props.get("email") or "").strip().lower()
+            if e:
+                emails.append(e)
+        return emails
+
+    # ----- Avoma: date window -----
+    def _date_window(self):
+        to_dt = datetime.now(timezone.utc)
+        from_dt = to_dt - timedelta(days=self.date_filter_days)
+        return from_dt.strftime("%Y-%m-%d"), to_dt.strftime("%Y-%m-%d")
+
+    # ----- Avoma: meetings for email (first page only, plus call-like filter) -----
+    def avoma_meetings_for_email(self, email: str) -> List[Dict[str, Any]]:
+        base = f"{self.avoma_base}/v1/meetings"
+        frm, to = self._date_window()
+
+        def fetch_first_page(params: Dict[str, Any]) -> List[Dict[str, Any]]:
+            r = self._request("GET", base, self.avoma_headers, params=params)
+            if not r or r.status_code == 404:
+                return []
+            if r.status_code == 400:
+                logger.error(f"Avoma 400: {r.text[:500]}")
+                r.raise_for_status()
+            r.raise_for_status()
+            data = r.json() or {}
+            items = data.get("results") or data.get("meetings") or []
+            return items
+
+        params_snake = {"participant_email": email, "from_date": frm, "to_date": to, "limit": self.avoma_limit}
+        items = fetch_first_page(params_snake)
+        if not items:
+            params_camel = {"participantEmail": email, "from_date": frm, "to_date": to, "limit": self.avoma_limit}
+            items = fetch_first_page(params_camel)
+
+        def looks_like_call(m: Dict[str, Any]) -> bool:
+            return bool(
+                m.get("transcript_ready") or
+                m.get("transcription_uuid") or
+                m.get("audio_ready") or
+                m.get("video_ready") or
+                (m.get("processing_status") in {"transcription_available", "completed", "notes_available"})
+            )
+
+        filtered = [m for m in items if looks_like_call(m)]
+        logger.info(f"Avoma first-page items: {len(items)} | call-like after filter: {len(filtered)}")
+        return filtered
+
+    # ----- Avoma: robust transcript fetch -----
+    def fetch_transcript_json(self, meeting_id: str, transcription_uuid: Optional[str]) -> Optional[Dict[str, Any]]:
+        r = self._request(
+            "GET",
+            f"{self.avoma_base}/v1/meetings/{meeting_id}/transcript",
+            self.avoma_headers,
+            params={"format": "json"},
+        )
+        if r and r.status_code == 200:
+            return r.json()
+        r = self._request("GET", f"{self.avoma_base}/v1/meetings/{meeting_id}/transcriptions", self.avoma_headers)
+        if r and r.status_code == 200:
+            data = r.json()
+            items = data.get("results", data) if isinstance(data, dict) else data
+            if isinstance(items, list) and transcription_uuid:
+                for it in items:
+                    if it.get("uuid") == transcription_uuid:
+                        return it
+            return items if items else None
+        if transcription_uuid:
+            r = self._request("GET", f"{self.avoma_base}/v1/transcriptions/{transcription_uuid}", self.avoma_headers)
+            if r and r.status_code == 200:
+                return r.json()
+        return None
+
+    # ----- Webhook post -----
+    def send_webhook_plaintext(self, matched_email: str, owner_email: Optional[str], meeting: Dict[str, Any], transcript_plain: str) -> bool:
+        meeting_id = meeting.get("uuid") or meeting.get("id") or meeting.get("meetingId")
+        payload = {
+            "email": matched_email,
+            "contact_owner_email": owner_email,
+            "meeting_id": meeting_id,
+            "meeting_subject": meeting.get("subject"),
+            "meeting_url": meeting.get("url") or meeting.get("app_url"),
+            "start_at": meeting.get("start_at") or meeting.get("startTime") or meeting.get("start_time"),
+            "organizer_email": meeting.get("organizer_email"),
+            "attendees_emails": safe_attendee_emails(meeting),
+            "transcript_text": transcript_plain,
+            "meeting_data": meeting,
+            "processed_at": datetime.now(timezone.utc).isoformat(),
+            "source": "hubspot_avoma_plaintext_pipeline",
+        }
+        size = sizeof_json(payload)
+        logger.info(f"POSTing webhook (size {size} bytes)")
+        try:
+            r = requests.post(self.webhook_url, json=payload, headers=self.webhook_headers, timeout=45)
+            logger.info(f"POST {self.webhook_url} -> {r.status_code} {(r.text or '')[:300]}")
+            return r.status_code in (200, 201, 202, 204)
+        except Exception as e:
+            logger.error(f"Webhook exception: {type(e).__name__}: {e}")
+            return False
+
+    # ----- Orchestrate -----
+    def run(self) -> Dict[str, Any]:
+        results = {
+            "contacts_processed": 0,
+            "emails_found": 0,
+            "meetings_found": 0,
+            "transcripts_posted": 0,
+            "errors": [],
+        }
+        try:
+            ids = self.get_list_member_contact_ids()
+            results["contacts_processed"] = len(ids)
+            if not ids:
+                logger.warning("No contacts in HubSpot list.")
+                return results
+
+            contacts = self.batch_read_contacts(ids, props=["email", "firstname", "lastname", "hubspot_owner_id"])
+            # Optional filter to specific emails
+            if self.only_emails:
+                contacts = [c for c in contacts if (c.get("properties", {}).get("email", "").strip().lower() in self.only_emails)]
+            emails = sorted(set(self.extract_emails(contacts)))
+            results["emails_found"] = len(emails)
+            if not emails:
+                logger.warning("No emails found after filtering.")
+                return results
+
+            cutoff = datetime.now(timezone.utc) - timedelta(days=self.date_filter_days)
+
+            for contact in contacts:
+                contact_email, owner_id = self.extract_email_and_owner_id(contact)
+                if not contact_email:
+                    continue
+                if self.only_emails and contact_email not in self.only_emails:
+                    continue
+
+                owner_email = self.get_owner_email(owner_id)
+                if not owner_email:
+                    logger.info(f"Skipping contact {contact_email}: no owner email found (owner_id={owner_id}).")
+                    continue
+
+                logger.info(f"Processing {contact_email} (owner: {owner_email})")
+
+                meetings = self.avoma_meetings_for_email(contact_email)
+                results["meetings_found"] += len(meetings)
+                if not meetings:
+                    continue
+
+                posted_for_email = False
+
+                for m in meetings:
+                    meeting_id = m.get("uuid") or m.get("id") or m.get("meetingId")
+                    if not meeting_id:
+                        continue
+
+                    start_raw = m.get("start_at") or m.get("startTime") or m.get("start_time") or m.get("start")
+                    if start_raw:
+                        try:
+                            ts = start_raw.replace("Z", "+00:00")
+                            dt = datetime.fromisoformat(ts)
+                            if not dt.tzinfo:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                            if dt < cutoff:
+                                logger.debug(f"Skipping old meeting {meeting_id} ({dt.isoformat()})")
+                                continue
+                        except Exception:
+                            logger.debug(f"Unparseable date for meeting {meeting_id}: {start_raw}")
+
+                    # HARD GATE: attendees must include BOTH contact and owner
+                    if not emails_required_in_meeting(m, contact_email, owner_email):
+                        logger.info(f"Skipping meeting {meeting_id} — attendees missing contact/owner email.")
+                        continue
+
+                    t_uuid = m.get("transcription_uuid")
+                    t_json = self.fetch_transcript_json(meeting_id, t_uuid)
+                    if not t_json:
+                        logger.info(f"No transcript JSON available for meeting {meeting_id}")
+                        continue
+
+                    t_text = transcript_json_to_text(t_json)
+                    if not t_text:
+                        logger.info(f"Transcript JSON returned but no text extracted for meeting {meeting_id}")
+                        continue
+
+                    ok = self.send_webhook_plaintext(contact_email, owner_email, m, t_text)
+                    if ok:
+                        results["transcripts_posted"] += 1
+                        posted_for_email = True
+                        logger.info(f"Posted first transcript for {contact_email}; stopping further search for this contact.")
+                        break
+                    else:
+                        results["errors"].append(f"Webhook failed for meeting {meeting_id}")
+
+                    time.sleep(self.rate_limit_delay)
+
+                if posted_for_email:
+                    time.sleep(self.rate_limit_delay)
+
+            logger.info("Pipeline completed")
+            logger.info(json.dumps(results, indent=2))
+            return results
+
+        except Exception as e:
+            msg = f"Pipeline failed: {type(e).__name__}: {e}"
+            logger.exception(msg)
+            results["errors"].append(msg)
+            return results
+
+# ---------- CLI ----------
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="HubSpot -> Avoma -> Webhook (contact AND owner must be attendees)")
+    p.add_argument("--days", type=int, default=int(os.environ.get("DATE_FILTER_DAYS", "60")))
+    p.add_argument("--delay", type=float, default=float(os.environ.get("RATE_LIMIT_DELAY", "0.5")))
+    p.add_argument("--avoma-limit", type=int, default=int(os.environ.get("AVOMA_LIMIT", "25")))
+    p.add_argument("--only-email", action="append", default=[], help="Process only this email (repeatable)")
+    return p.parse_args()
+
+def load_env() -> Dict[str, str]:
+    req = ["HUBSPOT_TOKEN", "AVOMA_API_KEY", "WEBHOOK_URL", "HUBSPOT_LIST_ID"]
+    missing = [k for k in req if not os.environ.get(k)]
+    if missing:
+        raise RuntimeError("Missing env vars: " + ", ".join(missing))
+    return {
+        "hubspot_token": os.environ["HUBSPOT_TOKEN"],
+        "avoma_api_key": os.environ["AVOMA_API_KEY"],
+        "webhook_url": os.environ["WEBHOOK_URL"],
+        "hubspot_list_id": os.environ["HUBSPOT_LIST_ID"],
+    }
+
+def main() -> None:
+    args = parse_args()
+    cfg = load_env()
+
+    pipeline = Pipeline(
+        hubspot_token=cfg["hubspot_token"],
+        avoma_api_key=cfg["avoma_api_key"],
+        webhook_url=cfg["webhook_url"],
+        hubspot_list_id=cfg["hubspot_list_id"],
+        rate_limit_delay=args.delay,
+        date_filter_days=args.days,
+        avoma_limit=args.avoma_limit,
+        only_emails=args.only_email,
+    )
+    results = pipeline.run()
+
+    print("\n" + "="*50)
+    print("PIPELINE SUMMARY")
+    print("="*50)
+    print(f"Contacts processed:    {results['contacts_processed']}")
+    print(f"Emails found:          {results['emails_found']}")
+    print(f"Meetings found:        {results['meetings_found']}")
+    print(f"Transcripts posted:    {results['transcripts_posted']}")
+    if results["errors"]:
+        print("Errors:")
+        for e in results["errors"]:
+            print(f"  - {e}")
+    print("="*50)
+
+if __name__ == "__main__":
+    main()
